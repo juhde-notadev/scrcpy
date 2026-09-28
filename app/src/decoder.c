@@ -1,13 +1,74 @@
 #include "decoder.h"
 
 #include <errno.h>
+#include <string.h>
 #include <libavcodec/packet.h>
 #include <libavutil/avutil.h>
+#include <libavutil/hwcontext.h>
 
 #include "util/log.h"
 
 /** Downcast packet_sink to decoder */
 #define DOWNCAST(SINK) container_of(SINK, struct sc_decoder, packet_sink)
+
+// scrcpy's SDL renderer accepts planar YUV420P frames. VA-API decodes AV1
+// into GPU surfaces, which are downloaded as NV12 and split into three planes.
+static AVFrame *
+sc_decoder_download_vaapi_frame(const AVFrame *hw_frame) {
+    AVFrame *nv12 = av_frame_alloc();
+    AVFrame *yuv = av_frame_alloc();
+    if (!nv12 || !yuv) {
+        LOG_OOM();
+        goto error;
+    }
+
+    int ret = av_hwframe_transfer_data(nv12, hw_frame, 0);
+    if (ret < 0 || nv12->format != AV_PIX_FMT_NV12) {
+        LOGE("Could not download AV1 VA-API frame as NV12: %d (format %d)",
+             ret, nv12->format);
+        goto error;
+    }
+
+    yuv->format = AV_PIX_FMT_YUV420P;
+    yuv->width = nv12->width;
+    yuv->height = nv12->height;
+    ret = av_frame_get_buffer(yuv, 32);
+    if (ret < 0) {
+        LOGE("Could not allocate YUV420P frame: %d", ret);
+        goto error;
+    }
+
+    for (int row = 0; row < yuv->height; ++row) {
+        memcpy(yuv->data[0] + row * yuv->linesize[0],
+               nv12->data[0] + row * nv12->linesize[0], yuv->width);
+    }
+
+    int chroma_width = (yuv->width + 1) / 2;
+    int chroma_height = (yuv->height + 1) / 2;
+    for (int row = 0; row < chroma_height; ++row) {
+        const uint8_t *uv = nv12->data[1] + row * nv12->linesize[1];
+        uint8_t *u = yuv->data[1] + row * yuv->linesize[1];
+        uint8_t *v = yuv->data[2] + row * yuv->linesize[2];
+        for (int col = 0; col < chroma_width; ++col) {
+            u[col] = uv[2 * col];
+            v[col] = uv[2 * col + 1];
+        }
+    }
+
+    ret = av_frame_copy_props(yuv, hw_frame);
+    if (ret < 0) {
+        LOGE("Could not copy AV1 frame metadata: %d", ret);
+        goto error;
+    }
+
+    av_frame_free(&nv12);
+    return yuv;
+
+error:
+    av_frame_free(&nv12);
+    av_frame_free(&yuv);
+    return NULL;
+}
 
 static bool
 sc_decoder_open(struct sc_decoder *decoder, AVCodecContext *ctx,
@@ -97,8 +158,19 @@ sc_decoder_push(struct sc_decoder *decoder, const AVPacket *packet) {
             decoder->frame_size = frame_size;
         }
 
-        bool ok = sc_frame_source_sinks_push(&decoder->frame_source,
-                                             decoder->frame);
+        AVFrame *downloaded = NULL;
+        AVFrame *output = decoder->frame;
+        if (decoder->frame->format == AV_PIX_FMT_VAAPI) {
+            downloaded = sc_decoder_download_vaapi_frame(decoder->frame);
+            if (!downloaded) {
+                av_frame_unref(decoder->frame);
+                return false;
+            }
+            output = downloaded;
+        }
+
+        bool ok = sc_frame_source_sinks_push(&decoder->frame_source, output);
+        av_frame_free(&downloaded);
         av_frame_unref(decoder->frame);
         if (!ok) {
             // Error already logged

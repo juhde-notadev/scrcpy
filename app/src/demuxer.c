@@ -2,8 +2,10 @@
 
 #include <assert.h>
 #include <inttypes.h>
+#include <stdlib.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/hwcontext.h>
 
 #include "packet_merger.h"
 #include "util/binary.h"
@@ -15,6 +17,20 @@
 #define SC_PACKET_FLAG_KEY_FRAME (UINT64_C(1) << 61)
 
 #define SC_PACKET_PTS_MASK (SC_PACKET_FLAG_KEY_FRAME - 1)
+
+static enum AVPixelFormat
+sc_av1_vaapi_get_format(AVCodecContext *ctx, const enum AVPixelFormat *formats) {
+    (void) ctx;
+    for (const enum AVPixelFormat *fmt = formats; *fmt != AV_PIX_FMT_NONE;
+         ++fmt) {
+        if (*fmt == AV_PIX_FMT_VAAPI) {
+            LOGI("AV1 decoding via VA-API");
+            return *fmt;
+        }
+    }
+    LOGW("AV1 VA-API format unavailable; using software decoding");
+    return formats[0];
+}
 
 static enum AVCodecID
 sc_demuxer_to_avcodec_id(uint32_t codec_id) {
@@ -210,7 +226,11 @@ run_demuxer(void *data) {
         goto end;
     }
 
-    const AVCodec *codec = avcodec_find_decoder(codec_id);
+    // FFmpeg may prioritize libdav1d, which cannot use VA-API. Its native AV1
+    // decoder exposes VA-API and can still fall back to software if needed.
+    const AVCodec *codec = codec_id == AV_CODEC_ID_AV1
+                         ? avcodec_find_decoder_by_name("av1")
+                         : avcodec_find_decoder(codec_id);
     if (!codec) {
         LOGE("Demuxer '%s': stream disabled due to missing decoder",
              demuxer->name);
@@ -253,6 +273,25 @@ run_demuxer(void *data) {
         codec_ctx->width = session_data.video.width;
         codec_ctx->height = session_data.video.height;
         codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+
+        if (codec_id == AV_CODEC_ID_AV1) {
+            LOGI("AV1 decoder selected: %s", codec->name);
+            const char *device = getenv("SCRCPY_VAAPI_DEVICE");
+            if (!device || !*device) {
+                device = "/dev/dri/renderD128";
+            }
+            AVBufferRef *hw_device = NULL;
+            int hw_ret = av_hwdevice_ctx_create(&hw_device,
+                AV_HWDEVICE_TYPE_VAAPI, device, NULL, 0);
+            if (hw_ret == 0) {
+                LOGI("AV1 VA-API device initialized: %s", device);
+                codec_ctx->hw_device_ctx = hw_device;
+                codec_ctx->get_format = sc_av1_vaapi_get_format;
+            } else {
+                LOGW("Cannot initialize VA-API for AV1 (%d); using software",
+                     hw_ret);
+            }
+        }
 
     } else {
         // Hardcoded audio properties
