@@ -28,8 +28,15 @@ sc_av1_vaapi_get_format(AVCodecContext *ctx, const enum AVPixelFormat *formats) 
             return *fmt;
         }
     }
-    LOGW("AV1 VA-API format unavailable; using software decoding");
-    return formats[0];
+    for (const enum AVPixelFormat *fmt = formats; *fmt != AV_PIX_FMT_NONE;
+         ++fmt) {
+        if (*fmt == AV_PIX_FMT_YUV420P) {
+            LOGW("AV1 VA-API format unavailable; using software decoding");
+            return *fmt;
+        }
+    }
+    LOGE("No AV1 decoder output format supported by the renderer");
+    return AV_PIX_FMT_NONE;
 }
 
 static enum AVCodecID
